@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="WeChat Auto Reply">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#07c160"/>
+      <stop offset="1" stop-color="#039a4a"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#g)"/>
+  <!-- 气泡 -->
+  <path d="M17 20h30a5 5 0 0 1 5 5v12a5 5 0 0 1-5 5H31l-9 7v-7h-5a5 5 0 0 1-5-5V25a5 5 0 0 1 5-5z" fill="#fff" opacity="0.95"/>
+  <!-- 三点 -->
+  <circle cx="25" cy="31" r="2.6" fill="#07c160"/>
+  <circle cx="32" cy="31" r="2.6" fill="#07c160"/>
+  <circle cx="39" cy="31" r="2.6" fill="#07c160"/>
+</svg>

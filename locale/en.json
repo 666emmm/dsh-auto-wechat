@@ -1,0 +1,34 @@
+{
+  "meta": {
+    "title": "WeChat Auto Reply",
+    "description": "Reads new messages from the WeChat window, hands them to a DSH session to answer, and can send images back. Switches, persona and allow-list live in Settings."
+  },
+  "status": {
+    "running": "Running",
+    "stopped": "Stopped",
+    "starting": "Starting"
+  },
+  "switches": {
+    "master": "Master switch",
+    "masterDesc": "Stops the vision subprocess immediately and restores the WeChat window position",
+    "readOnly": "Read-only",
+    "readOnlyDesc": "Keeps recognising and advancing sessions, but never sends",
+    "group": "Group auto-reply",
+    "groupDesc": "When off, group chats advance the session but stay silent"
+  },
+  "deps": {
+    "title": "Dependencies",
+    "mirror": "Download source",
+    "installed": "Installed",
+    "missing": "Needs download",
+    "download": "Download",
+    "remove": "Remove",
+    "checking": "Checking…"
+  },
+  "log": {
+    "title": "Live log",
+    "clear": "Clear",
+    "open": "Open log file",
+    "export": "Export last 500 lines"
+  }
+}
