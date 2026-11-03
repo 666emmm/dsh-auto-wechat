@@ -18,6 +18,12 @@ import { loadHostDeps } from './lib/hostdeps.mjs'
 import { createBridge } from './lib/bridge.mjs'
 import { checkDeps, downloadDeps, removeDeps, DEFAULT_MIRRORS } from './lib/deps.mjs'
 
+// ⭐ schemastery 从宿主树里取（拿不到就是 undefined —— 插件照常加载，只是没有 Config，
+//    绝不因为一个 import 让整条插件不激活）
+const hostDeps = await loadHostDeps()
+const z = hostDeps.z
+const defineTool = hostDeps.defineTool
+
 export const name = 'dsh-auto-wechat'
 // webServer 是设置页通信必需；tools 用来给会话暴露 wechat_* 工具
 export const inject = ['webServer', 'tools']
@@ -31,18 +37,21 @@ export function stateDir() {
 }
 
 /**
- * 注意：数值范围一律在 clamp 里钳，schema 不写 .max()。
- * 老坑：schema 校验不过 ⇒ cordis 拒收这条 entry ⇒ 整条插件不激活。
+ * 🔴 每个字段都要 `.extra('volatile', true)`：DSH 的 settings.update() 只认 volatile 字段
+ *    （volatileForm(schema)，见 dsh-settings），没有这个标记写设置时会抛
+ *    "Plugin entry … has no volatile fields"。
+ * ⚠️ 数值范围一律在 clamp 里钳，schema 里**不写 .max()** ——
+ *    schema 校验不过会让整条插件不激活（老坑）。
  */
-export const Config = (z) => z?.object?.({
-  pythonPath: z.string().default('auto'),
-  runtimeDir: z.string().default(''),
-  checkInterval: z.number().default(0.5),
-  autoReply: z.boolean().default(true),
-  autoReplyGroup: z.boolean().default(false),
-  readOnly: z.boolean().default(false),
-  mirror: z.string().default(DEFAULT_MIRRORS[1].index),
-}) ?? undefined
+export const Config = !z ? undefined : z.object({
+  pythonPath: z.string().default('auto').extra('volatile', true),
+  runtimeDir: z.string().default('').extra('volatile', true),
+  checkInterval: z.number().default(0.5).extra('volatile', true),
+  autoReply: z.boolean().default(true).extra('volatile', true),
+  autoReplyGroup: z.boolean().default(false).extra('volatile', true),
+  readOnly: z.boolean().default(false).extra('volatile', true),
+  mirror: z.string().default(DEFAULT_MIRRORS[1].index).extra('volatile', true),
+})
 
 function clampNumber(v, min, max, fallback) {
   const n = Number(v)
@@ -88,13 +97,40 @@ function saveConfigFile(patch) {
   return next
 }
 
+/**
+ * 默认值单列一份，不靠 schema 反查。
+ * 为什么：volatile 字段在 schema 里会被包成 { get, [volatile.write] } 形态，
+ * 而 apply(ctx, config) 收到的是 loader 校验后的**纯值**。
+ * bili-pond 踩过同一个坑 —— 读配置一律走 normalize(纯值, DEFAULTS)。
+ */
+const DEFAULTS = {
+  pythonPath: 'auto',
+  runtimeDir: '',
+  checkInterval: 0.5,
+  autoReply: true,
+  autoReplyGroup: false,
+  readOnly: false,
+  mirror: DEFAULT_MIRRORS[1].index,
+}
+
+function normalize(src, base) {
+  const out = { ...base }
+  for (const k of Object.keys(base)) {
+    const v = src?.[k]
+    if (v === undefined || v === null) continue
+    if (typeof base[k] === 'number') { const n = Number(v); if (Number.isFinite(n)) out[k] = n }
+    else if (typeof base[k] === 'boolean') { if (typeof v === 'boolean') out[k] = v }
+    else if (typeof base[k] === 'string') { if (typeof v === 'string') out[k] = v }
+  }
+  return out
+}
+
 export async function apply(ctx, rawConfig = {}) {
-  const { z, defineTool, notes } = await loadHostDeps()
   const logger = typeof ctx.logger === 'function' ? ctx.logger('dsh-auto-wechat') : (ctx.logger ?? console)
   logger.info?.('[dsh-auto-wechat] 加载中…')
-  for (const n of notes) logger.info?.(`[dsh-auto-wechat] ${n}`)
+  for (const n of hostDeps.notes) logger.info?.(`[dsh-auto-wechat] ${n}`)
 
-  const cfg = (Config(z) ? Config(z)(rawConfig) : rawConfig) ?? {}
+  const cfg = normalize(rawConfig, DEFAULTS)
 
   const runtime = {
     pythonPath: String(cfg.pythonPath ?? 'auto'),
