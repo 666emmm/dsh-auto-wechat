@@ -293,11 +293,12 @@ window.__ModuleLoader__.load({
           (items || []).length
             ? items.map((it, i) => h('div', {
                 key: `${it}-${i}`,
-                style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '5px 8px', borderRadius: 6, fontSize: 12.5 },
+                style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 6, padding: '5px 8px', borderRadius: 6, fontSize: 12.5 },
               },
-                h('span', null, it),
+                // 长名字要能换行，不能把整列顶宽
+                h('span', { style: { minWidth: 0, overflowWrap: 'anywhere' } }, it),
                 h('span', {
-                  style: { cursor: 'pointer', color: T.idle, fontSize: 14, padding: '0 4px' },
+                  style: { cursor: 'pointer', color: T.idle, fontSize: 14, padding: '0 4px', flex: 'none' },
                   onClick: () => onChange(items.filter((_, j) => j !== i)),
                   title: '移除',
                 }, '×')))
@@ -305,7 +306,9 @@ window.__ModuleLoader__.load({
         ),
         h('div', { style: { display: 'flex', gap: 6, marginTop: 8 } },
           h('input', {
-            style: css.input, value: draft, placeholder,
+            // minWidth:0 必须写：flex 子项默认 min-width:auto，placeholder 会把输入框顶出列宽
+            style: { ...css.input, minWidth: 0 },
+            value: draft, placeholder,
             onChange: (e) => setDraft(e.target.value),
             onKeyDown: (e) => { if (e.key === 'Enter') add() },
           }),
@@ -330,22 +333,32 @@ window.__ModuleLoader__.load({
         setSaving(false)
       }
       return h('div', { style: css.wrap },
-        h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 } },
-          h(ListEditor, {
+        // 三栏在设置面板里太窄，横向会被切掉。改成 auto-fit：宽了就并排，窄了自动换行堆叠。
+        // 每个单元格 minmax(220px,1fr) + minWidth:0 —— 后者是关键，grid 子项默认 min-width:auto
+        // 会撑破容器（输入框的 placeholder 就把列顶宽了）。
+        h('div', {
+          style: {
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+            gap: 12,
+            alignItems: 'start',
+          },
+        },
+          h('div', { style: { minWidth: 0 } }, h(ListEditor, {
             title: '💬 单聊白名单',
             items: cfg?.whitelist, placeholder: '好友备注名',
             onChange: (v) => set({ whitelist: v }),
-          }),
-          h(ListEditor, {
+          })),
+          h('div', { style: { minWidth: 0 } }, h(ListEditor, {
             title: '👥 群聊白名单', badge: 'w',
-            items: cfg?.group_whitelist, placeholder: '群名，不用带 (人数)',
+            items: cfg?.group_whitelist, placeholder: '群名，不带 (人数)',
             onChange: (v) => set({ group_whitelist: v }),
-          }),
-          h(ListEditor, {
+          })),
+          h('div', { style: { minWidth: 0 } }, h(ListEditor, {
             title: '🚫 黑名单',
             items: cfg?.blacklist, placeholder: '始终不回复的对象',
             onChange: (v) => set({ blacklist: v }),
-          }),
+          })),
         ),
         h(Card, { title: '节奏' },
           h(Row, { title: '检查间隔（秒）', desc: '越小越灵敏，越费 CPU。0.5 是默认' },

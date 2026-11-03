@@ -236,13 +236,29 @@ export async function apply(ctx, rawConfig = {}) {
   // ── 给会话用的工具 ────────────────────────────────────────────────
   const tool = (spec) => ctx.tools.register(defineTool(spec))
 
+  // 宿主只吃「无损 JSON」：函数 / 循环引用 / 类实例都会报 value is not lossless JSON
+  const safe = (v) => {
+    try { return JSON.parse(JSON.stringify(v)) } catch { return { ok: false, error: 'unserializable' } }
+  }
+  // 每个工具都必须声明 output —— 不写就报
+  // `tool "xxx" must declare output { schema, render, presentationMeta? }`，整条插件不激活
+  const textOutput = {
+    schema: { type: 'object', properties: {}, additionalProperties: true },
+    render: (_args, value) => [{
+      type: 'text',
+      text: typeof value === 'string' ? value : JSON.stringify(value, null, 2),
+    }],
+  }
+  const wrap = (fn) => async (args) => safe(await fn(args ?? {}))
+
   tool({
     name: 'wechat_status',
     description: '看微信自动回复现在什么状态：子进程有没有起来、Python 版本、盯到微信窗口没有、'
       + '已连几个会话、最近识别到什么、开关各自开着还是关着。'
       + '用户问「微信那边怎么样」「它有没有在跑」时先调这个。',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
-    async execute() { return bridge.status() },
+    output: textOutput,
+    execute: wrap(async () => bridge.status()),
   })
 
   tool({
@@ -258,7 +274,8 @@ export async function apply(ctx, rawConfig = {}) {
       required: ['conv', 'text'],
       additionalProperties: false,
     },
-    async execute(args) { return bridge.send(String(args.conv ?? ''), String(args.text ?? '')) },
+    output: textOutput,
+    execute: wrap(async (args) => bridge.send(String(args.conv ?? ''), String(args.text ?? ''))),
   })
 
   tool({
@@ -273,14 +290,16 @@ export async function apply(ctx, rawConfig = {}) {
       },
       additionalProperties: false,
     },
-    async execute(args) { return bridge.read(String(args.conv ?? ''), clampNumber(args.limit, 1, 100, 20)) },
+    output: textOutput,
+    execute: wrap(async (args) => bridge.read(String(args.conv ?? ''), clampNumber(args.limit, 1, 100, 20))),
   })
 
   tool({
     name: 'wechat_contacts',
     description: '列出微信自动回复出现过的对话（单聊/群聊）、各自在 DSH 里对应哪个会话。',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
-    async execute() { return bridge.contacts() },
+    output: textOutput,
+    execute: wrap(async () => bridge.contacts()),
   })
 
   logger.info?.('[dsh-auto-wechat] 已加载（子进程等总开关打开才起）')
