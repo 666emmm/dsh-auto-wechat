@@ -354,31 +354,37 @@ window.__ModuleLoader__.load({
                   key: it.sessionId,
                   style: { display: 'flex', alignItems: 'center', gap: 8, padding: '5px 8px', fontSize: 12, borderBottom: `1px dashed ${T.bd1}` },
                 },
-                  h('span', { style: css.dot(it.running ? T.warn : it.blank ? T.idle : T.ok) }),
+                  h('span', { style: css.dot(it.running ? T.warn : it.ghost ? T.err : it.blank ? T.idle : T.ok) }),
                   h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
                     it.conv ? `微信 · ${it.conv}` : it.sessionId),
-                  h('span', { style: css.badge(it.blank ? undefined : 'g') },
-                    it.running ? '运行中' : it.blank === true ? '空' : it.blank === null ? '未知' : '有记录')))
+                  h('span', { style: css.badge(it.ghost ? 'w' : it.blank ? undefined : 'g') },
+                    it.running ? '运行中'
+                      : it.ghost ? '幽灵（实体已丢失）'
+                        : it.blank === true ? '空' : '有记录')))
               : h('div', { style: { color: T.idle, fontSize: 12, padding: '20px 8px', textAlign: 'center' } },
                   '还没有会话 —— 微信来消息后会自动建')),
           h(Row, {
-            title: `共 ${inventory.length} 个 · 其中空会话 ${inventory.filter((x) => x.blank === true && !x.running).length} 个`,
-            desc: '清理只归档「空 + 未绑定 + 不在跑」的。有聊天记录的会被跳过，绝不会丢',
+            title: `共 ${inventory.length} 个 · 空 ${inventory.filter((x) => x.blank === true && !x.running).length}`
+              + ` · 幽灵 ${inventory.filter((x) => x.ghost).length}`,
+            desc: '清理会做两件事：清掉实体已丢失的幽灵条目、归档真空会话（blank）。'
+              + '有聊天记录的会被跳过，绝不会丢',
             last: true,
           },
             h('button', {
               style: css.btn(false),
               onClick: async () => {
                 const r = await rpc('sessionsPrune', {})
+                const g = r?.ghosts?.length ?? 0
                 const n = r?.archived?.length ?? 0
-                const skipped = r?.skipped?.filter((s) => s.why !== '已绑定') ?? []
+                const kept = (r?.skipped ?? []).filter((s) => s.why !== '已绑定')
                 setPruneMsg(r?.ok
-                  ? `归档 ${n} 个空会话${skipped.length ? `，保留 ${skipped.length} 个（${[...new Set(skipped.map((s) => s.why))].join('/')}）` : ''}`
+                  ? `清掉 ${g} 个幽灵条目，归档 ${n} 个空会话`
+                    + (kept.length ? `，保留 ${kept.length} 个（${[...new Set(kept.map((s) => s.why))].join('/')}）` : '')
                   : `失败：${r?.error ?? ''}`)
                 const inv = await rpc('sessionsInventory', {})
                 if (inv?.ok) setInventory(inv.items ?? [])
               },
-            }, '清理空会话'))),
+            }, '清理'))),
         pruneMsg ? h('div', { style: { color: T.lb2, fontSize: 12, marginTop: -8 } }, pruneMsg) : null,
 
         h(Card, { title: '实时日志' },

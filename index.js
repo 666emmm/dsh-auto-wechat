@@ -313,9 +313,20 @@ export async function apply(ctx, rawConfig = {}) {
       (l) => logger.info?.(`[deps] ${l}`),
     ),
 
-    // 清掉历史遗留的空会话（同一对话重试堆出来的那些）
-    // 只归档 blank=true 的；有聊天记录的绝不碰
-    'POST /sessions/prune': () => hub.pruneUnbound(),
+    // 清会话：先清幽灵（账面有、实体没了），再归档真空会话（blank=true）
+    // 有聊天记录的绝不碰
+    'POST /sessions/prune': async () => {
+      const ghosts = await hub.pruneGhosts()
+      const blanks = await hub.pruneUnbound()
+      return {
+        ok: true,
+        ghosts: ghosts?.removed ?? [],
+        ghostSkipped: ghosts?.skipped ?? [],
+        archived: blanks?.archived ?? [],
+        skipped: blanks?.skipped ?? [],
+        error: blanks?.ok === false ? blanks.error : undefined,
+      }
+    },
 
     // 当前绑定情况
     'GET /sessions': () => ({
