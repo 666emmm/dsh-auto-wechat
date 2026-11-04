@@ -212,13 +212,15 @@ def ocr_engine(img, *args, **kwargs):
 # =============================================================================
 # 2. CONFIGURATION & STATE MANAGEMENT
 # =============================================================================
-LAST_PROCESSED_SIGNATURE = {}
-# 每个对话最后处理过的时间。签名必须配时间窗，否则"对方隔很久又说同一句话"
-# 会被永久拦住（表现为偶尔不回消息）。
-LAST_PROCESSED_AT = {}
 # 每个对话最后处理过的文本 + 时间，用途同上（防气泡滚动重识别）
 LAST_REPLIED_TEXT = {}
 LAST_REPLIED_AT = {}
+# 已处理过的气泡批次。键是 (对话名, 归一化后的聚合文本)。
+# 为什么用集合而不是时间戳：时间窗是错的判据（12 秒太短、600 秒照样会过期）。
+# 正确语义是"这批气泡还在屏幕上就算处理过"，靠本轮聚合文本变化来失效。
+HANDLED_BUBBLES = set()
+# 上一轮的聚合文本（归一化），用于判断"屏幕上那批气泡换没换"
+LAST_PENDING_TEXT = {}
 API_CONVERSATION_HISTORY = {}
 LAST_CLICKED_CANDIDATE_TIME = {}
 SEND_FAIL_RETRY = {}
@@ -505,34 +507,66 @@ def activate_wechat(hwnd):
         return False
 
 def restore_user_foreground(orig_hwnd, wx_hwnd):
-    """把前台焦点还给用户原窗口：先用原来的普通方式，失败了才用线程输入附加兜底。
-    不移动、不缩放任何窗口；还原失败时写一条日志，方便定位。"""
+    """把前台焦点还给用户原窗口。
+
+    ── 2026-11-04 加重试 ──
+    Windows 有「前台锁定」：非前台进程调 SetForegroundWindow 常被静默拒绝。
+    原来只试一次就放弃，实测偶尔失败（用户看到 [焦点还原失败]，打字被打断）。
+    现在最多 3 轮，逐轮升级手段，间隔递增。
+    """
     if not orig_hwnd or orig_hwnd == wx_hwnd:
         return True
-    try:
-        if not user32.IsWindow(orig_hwnd):
-            return False
-        user32.SetForegroundWindow(orig_hwnd)          # ① 和原来完全一样的做法
-        if user32.GetForegroundWindow() == orig_hwnd:
-            return True
-        fg = user32.GetForegroundWindow()              # ② 被 Windows 拒绝时才兜底
-        fg_thread = user32.GetWindowThreadProcessId(fg, None) if fg else 0
-        my_thread = kernel32.GetCurrentThreadId()
-        attached = False
+
+    def _is_fg(h):
         try:
-            if fg_thread and fg_thread != my_thread:
-                attached = bool(user32.AttachThreadInput(my_thread, fg_thread, True))
+            return user32.GetForegroundWindow() == h
+        except Exception:
+            return False
+
+    for attempt in range(3):
+        try:
+            if not user32.IsWindow(orig_hwnd):
+                return False
+
+            # ① 最直接的方式
             user32.SetForegroundWindow(orig_hwnd)
-        finally:
-            if attached:
-                user32.AttachThreadInput(my_thread, fg_thread, False)
-        time.sleep(0.02)
-        ok = (user32.GetForegroundWindow() == orig_hwnd)
-        if not ok:
-            log("⚠️ [焦点还原失败] 未能把键盘焦点还给原窗口，请点一下你正在用的窗口再继续打字")
-        return ok
-    except Exception:
-        return False
+            if _is_fg(orig_hwnd):
+                return True
+
+            # ② 线程输入附加，绕过前台锁定
+            fg = user32.GetForegroundWindow()
+            fg_thread = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+            my_thread = kernel32.GetCurrentThreadId()
+            attached = False
+            try:
+                if fg_thread and fg_thread != my_thread:
+                    attached = bool(user32.AttachThreadInput(my_thread, fg_thread, True))
+                user32.BringWindowToTop(orig_hwnd)
+                user32.SetForegroundWindow(orig_hwnd)
+            finally:
+                if attached:
+                    user32.AttachThreadInput(my_thread, fg_thread, False)
+
+            time.sleep(0.05 + attempt * 0.1)
+            if _is_fg(orig_hwnd):
+                return True
+
+            # ③ 模拟一次 Alt 键解除前台锁定（Windows 经典 workaround）
+            try:
+                user32.keybd_event(0x12, 0, 0, 0)      # Alt down
+                user32.keybd_event(0x12, 0, 2, 0)      # Alt up
+                time.sleep(0.03)
+                user32.SetForegroundWindow(orig_hwnd)
+                time.sleep(0.05)
+                if _is_fg(orig_hwnd):
+                    return True
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    log("⚠️ [焦点还原失败] 3 次尝试都没能把键盘焦点还给原窗口，请点一下你正在用的窗口再继续打字")
+    return False
 
 def post_click_client_point(hwnd, client_x, client_y):
     """
@@ -1342,9 +1376,24 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply, is_group=False):
             restore_user_foreground(user_orig_hwnd, hwnd)
                 
         # 7. 渲染沉降与严谨差分动态绿底增量闭环验收
-        time.sleep(0.35) # 等待微信 Qt5 气泡动画与排版彻底沉降
+        # ⚠️ 2026-11-04：原来只 sleep 0.35 秒就抓图比对，实测微信发出去后
+        #    气泡动画 + 列表滚动还没稳定，差分判不出来 → 误报"未验证"。
+        #    现在做两次采样：先等 0.6 秒抓一次，没判出来再等 0.8 秒抓第二次，
+        #    任一判 True 就算成功。仍然判不出来才标 unverified（但绝不重发）。
+        time.sleep(0.6)
         img_post, _, _ = grab_wechat_window(hwnd)
         verdict = verify_diff_bubble_success(img_pre, img_post, cur_layout)
+
+        if verdict is not True and verdict != "UNCERTAIN":
+            # 第二次采样：给动画和滚动更多时间
+            time.sleep(0.8)
+            img_post2, _, _ = grab_wechat_window(hwnd)
+            v2 = verify_diff_bubble_success(img_pre, img_post2, cur_layout)
+            if v2 is True:
+                verdict = True
+            elif v2 == "UNCERTAIN" and verdict is False:
+                verdict = False   # 保持原判，不因为抓图失败而升级成 UNCERTAIN
+
         if verdict is True:
             send_success = True
             break
@@ -1581,31 +1630,34 @@ def scan_and_reply_wechat(hwnd):
                 #
                 # 现在：只留「谁 + 说了什么」。这才是"这条消息处理过没有"的真正依据。
                 # 连发聚合时 combined_text 本身就是稳定的（多句拼接结果一致）。
-                current_sig = (current_active_target, _normalize_sig_text(combined_text))
-                # 两道闸，都带时间窗（默认 12 秒）：
-                #   ① 签名相同    = 这条内容刚处理过 → 跳过
-                #   ② 文本等于最后处理的那句 → 判定为气泡滚动/重排导致的重复识别 → 跳过
+                # ── 2026-11-04 第三次修正：彻底不用时间窗 ──
                 #
-                # 为什么必须带时间窗：对方完全可能过一会儿真的又说了同一句话
-                # （"在吗" → 回复 → 十分钟后又"在吗"），那时必须正常回。
-                # 没有时间窗就会被永久拦住，表现为"偶尔不回消息"。
-                # ⚠️ 时间窗不能用小的（2026-11-04 用户实测）：
-                # 主循环一轮约 13~14 秒（OCR 慢），而之前窗口只有 12 秒，
-                # 于是每轮都"过期"→ 同一句话被判成新消息 4 次。
-                # 正确的语义是：**这些气泡还在屏幕上，就一直算处理过**。
-                # 所以改成按内容持久去重（10 分钟窗口），
-                # 只有出现不同的文本才更新。
-                now_ts = time.time()
-                DEDUPE_WINDOW = 600.0
-                sig_same = (
-                    LAST_PROCESSED_SIGNATURE.get(current_active_target) == current_sig
-                    and now_ts - LAST_PROCESSED_AT.get(current_active_target, 0) < DEDUPE_WINDOW
-                )
-                text_same = (
-                    LAST_REPLIED_TEXT.get(current_active_target) == combined_text
-                    and now_ts - LAST_REPLIED_AT.get(current_active_target, 0) < DEDUPE_WINDOW
-                )
-                if not (sig_same or text_same):
+                # 前两次都错了：
+                #   12 秒窗口 → 主循环一轮 13~14 秒，每轮都过期 → 判成新消息 4 次
+                #   600 秒窗口 → 只是把错推远，过 600 秒照样重复
+                #
+                # 根本原因：用"多久之前处理过"当判据，本质上是在猜。
+                # 正确判据是**气泡在不在屏幕上**：
+                #   · 这批气泡内容已经在 HANDLED_BUBBLES 里 → 处理过，跳过
+                #   · 内容不在里面 → 新消息，处理并加入集合
+                #   · 内容从屏幕上消失了 → 从集合里移除（这样对方真的又说一遍
+                #     同样的话时，会先消失再出现，能正常触发）
+                #
+                # 不需要任何时间窗，也不会因为过多久而失效。
+                sig_key = _normalize_sig_text(combined_text)
+                seen_key = (current_active_target, sig_key)
+                already_handled = seen_key in HANDLED_BUBBLES
+
+                # 清理：如果本轮的聚合文本已经变了，说明屏幕上那批待回复气泡换了，
+                # 之前记的就作废（否则对方过很久再说同样的话会被误拦）。
+                # ⚠️ 必须用**聚合文本**统一口径 —— seen_key 存的是 combined_text 的归一化，
+                #    这里若用单个气泡的文本去比，永远对不上，记录会立刻被清掉。
+                prev = LAST_PENDING_TEXT.get(current_active_target)
+                if prev is not None and prev != sig_key:
+                    HANDLED_BUBBLES.discard((current_active_target, prev))
+                LAST_PENDING_TEXT[current_active_target] = sig_key
+
+                if not already_handled:
                     
                     # 🌟 极速动态像素沉降判定 (Dynamic Pixel Settling):
                     # 短暂等待 0.35 秒 (人类打字发句最小停顿)，若右侧气泡像素无变动，立即判定单句发送完毕，0秒多余等待直接交由 AI！
@@ -1629,8 +1681,9 @@ def scan_and_reply_wechat(hwnd):
                                 if pending_lat and combined_lat:
                                     pending_bubbles = pending_lat
                                     combined_text = combined_lat
-                                    # 同上：签名只留「谁 + 说了什么」，不带像素坐标
-                                    current_sig = (current_active_target, _normalize_sig_text(combined_text))
+                                    # 聚合文本变了 → 重新算 key，否则登记的会是旧文本
+                                    sig_key = _normalize_sig_text(combined_text)
+                                    seen_key = (current_active_target, sig_key)
                             
                     log(f"\n📩 [当前会话锁定·连发聚合] 收到当前好友【{current_active_target}】新消息({len(pending_bubbles)}条): \"{combined_text}\"")
 
@@ -1645,8 +1698,7 @@ def scan_and_reply_wechat(hwnd):
                             combined_text=combined_text,
                         )
                         # 登记签名：同一条内容不再重复上报（配合插件侧指纹去重，双保险）
-                        LAST_PROCESSED_SIGNATURE[current_active_target] = current_sig
-                        LAST_PROCESSED_AT[current_active_target] = time.time()
+                        HANDLED_BUBBLES.add(seen_key)
                         # 额外记住"这个对话最后处理过的那句话 + 时间"。
                         # 回复发出后气泡会滚动，OCR 可能把同一句话换个位置再识别出来；
                         # 有了这个（带 12 秒时间窗）即使签名计算有偏差也不会重复上报。
@@ -1667,29 +1719,26 @@ def scan_and_reply_wechat(hwnd):
                         # 执行发送
                         success = send_reply_instant(hwnd, rect, layout, current_active_target, final_reply, is_group=is_group_target)
                         if success:
-                            LAST_PROCESSED_SIGNATURE[current_active_target] = current_sig
-                            LAST_PROCESSED_AT[current_active_target] = time.time()
-                            SEND_FAIL_RETRY.pop(current_sig, None)
+                            HANDLED_BUBBLES.add(seen_key)
+                            SEND_FAIL_RETRY.pop(sig_key, None)
                         else:
-                            fail_count = SEND_FAIL_RETRY.get(current_sig, 0) + 1
-                            SEND_FAIL_RETRY[current_sig] = fail_count
+                            fail_count = SEND_FAIL_RETRY.get(sig_key, 0) + 1
+                            SEND_FAIL_RETRY[sig_key] = fail_count
                             if fail_count >= 2:
                                 # 连续 2 次发送脱靶（如微信窗口遮挡或最小化），锁定签名放弃以防重试风暴无限消耗 API 额度
-                                LAST_PROCESSED_SIGNATURE[current_active_target] = current_sig
-                                LAST_PROCESSED_AT[current_active_target] = time.time()
-                                SEND_FAIL_RETRY.pop(current_sig, None)
+                                HANDLED_BUBBLES.add(seen_key)
+                                SEND_FAIL_RETRY.pop(sig_key, None)
                                 log(f"🚫 [重试超限熔断] 好友【{current_active_target}】消息连续 2 次发送脱靶，已放弃该条回复以防死循环。")
                             else:
                                 log(f"⚠️ [发送脱靶记录] 好友【{current_active_target}】第 {fail_count} 次发送未成，将在下个心跳周期进行 1 次补偿重试。")
                     else:
                         # 生成回复为空（如未填 Key 或 API 异常），记录告警并登记签名防空转
                         log(f"⚠️ [AI生成跳过] 好友【{current_active_target}】消息未获得有效AI回复 (API超时/网络抖动或未配Key)，登记签名防空转。")
-                        LAST_PROCESSED_SIGNATURE[current_active_target] = current_sig
-                        LAST_PROCESSED_AT[current_active_target] = time.time()
+                        HANDLED_BUBBLES.add(seen_key)
 
                     # 本次已处理新消息，返回结束本轮调度
                     return
-                elif current_sig in SEND_FAIL_RETRY:
+                elif sig_key in SEND_FAIL_RETRY:
                     # 处于重试等待中，坚守当前窗口
                     return
 
