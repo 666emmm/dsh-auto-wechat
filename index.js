@@ -206,11 +206,24 @@ export async function apply(ctx, rawConfig = {}) {
   ctx.effect(() => () => bridge.dispose(), 'dsh-auto-wechat: python 子进程')
   ctx.effect(() => () => hub.dispose(), 'dsh-auto-wechat: 会话绑定')
 
-  // 插件加载时先把工作区准备好（异步，失败不影响加载）
-  void hub.ensureWorkspace().then((id) => {
-    if (id) logger.info?.(`[dsh-auto-wechat] 工作区「微信」就绪 → ${sessionsCwd}`)
-    else logger.warn?.('[dsh-auto-wechat] 工作区未建立，会话会落到「未分组」')
-  }).catch(() => {})
+  // 插件加载时：建工作区 + 认领上次留下的「未分组」孤儿会话
+  // （上一版没调 attachSession，会话会散在未分组里）
+  void (async () => {
+    try {
+      const ws = await hub.ensureWorkspace()
+      if (!ws) {
+        logger.warn?.('[dsh-auto-wechat] 工作区未建立，会话会落到「未分组」')
+        return
+      }
+      logger.info?.(`[dsh-auto-wechat] 工作区「微信」就绪 → ${sessionsCwd}`)
+      const r = await hub.adoptOrphans()
+      if (r?.ok && r.moved?.length) {
+        logger.info?.(`[dsh-auto-wechat] 认领 ${r.moved.length} 个游离会话进「微信」工作区`)
+      }
+    } catch (e) {
+      logger.warn?.(`[dsh-auto-wechat] 工作区/认领失败：${e?.message ?? e}`)
+    }
+  })()
 
   // ── 设置页 HTTP 接口 ───────────────────────────────────────────────
   const routes = {
