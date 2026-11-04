@@ -47,10 +47,32 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-CONFIG_FILE = os.path.join(BASE_DIR, "wechat_config_dev.json")
-CONVO_MAP_FILE = os.path.join(BASE_DIR, "wechat_convo_map.json")
-PID_FILE = os.path.join(BASE_DIR, "wechat_bot_dev.pid")
-LOG_FILE = os.path.join(BASE_DIR, "wechat_bot_dev.log")
+# 数据目录：配置/日志/pid 一律落在这里，不再放插件包内。
+# 优先级：--data-dir 参数 > 环境变量 > $DSH_HOME/integrations/dsh-auto-wechat > 包目录（兜底）
+def _resolve_data_dir():
+    for i, a in enumerate(sys.argv):
+        if a == "--data-dir" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith("--data-dir="):
+            return a.split("=", 1)[1]
+    env = os.environ.get("DSH_AUTO_WECHAT_DATA")
+    if env:
+        return env
+    home = os.environ.get("DSH_HOME")
+    if not home:
+        home = os.path.join(os.path.expanduser("~"), ".dsh")
+    return os.path.join(home, "integrations", "dsh-auto-wechat")
+
+DATA_DIR = _resolve_data_dir()
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    DATA_DIR = BASE_DIR   # 建不出来就退回包目录，至少还能跑
+
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+CONVO_MAP_FILE = os.path.join(DATA_DIR, "wechat_convo_map.json")
+PID_FILE = os.path.join(DATA_DIR, "wechat_bot.pid")
+LOG_FILE = os.path.join(DATA_DIR, "wechat.log")
 
 try:
     if sys.stdout:
@@ -142,7 +164,50 @@ def init_ocr():
     return RapidOCR()
 
 # Initialize local neural network OCR engine
-ocr_engine = init_ocr()
+_rapid_ocr = init_ocr()
+
+def ocr_engine(img, *args, **kwargs):
+    """
+    统一入口：**永远把 PIL Image 先转成 numpy 再交给 rapidocr**。
+
+    ── 为什么必须这样（2026-11-04 定位）──
+    rapidocr_onnxruntime/utils/load_image.py 里：
+
+        if channel == 3:
+            if issubclass(origin_img_type, (str, Path, bytes, Image.Image)):
+                return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)   # ← 传 PIL 走这条
+            return img                                        # ← 传 ndarray 直接返回
+
+    传 PIL Image 时它会自己调 cv2.cvtColor，而这台机器上 opencv 5.0.0 +
+    numpy 2.5.4 这个组合会**偶发**抛 `cv2.error: Unknown C++ exception
+    from OpenCV code`（20 次压测不复现，但守护进程里必现）。
+
+    传 numpy 数组则完全跳过那行 cvtColor —— 我们自己在外面转，可控。
+    注意通道顺序：PIL 是 RGB，rapidocr 对 ndarray 输入**不做转换**，
+    直接当 BGR 用。所以这里要自己 cv2.cvtColor(RGB2BGR)，
+    否则红蓝通道颠倒会影响彩色气泡判定（绿底/非绿底）。
+    """
+    import numpy as _np
+    try:
+        import cv2 as _cv2
+    except Exception:
+        _cv2 = None
+
+    arr = img
+    if not isinstance(arr, _np.ndarray):
+        # PIL / 其它 → ndarray（RGB）
+        arr = _np.array(img)
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        arr = arr[:, :, :3]           # 去 alpha
+    if arr.ndim == 3 and arr.shape[2] == 3 and _cv2 is not None:
+        # RGB → BGR，跟 rapidocr 自己会做的事保持一致
+        try:
+            arr = _cv2.cvtColor(_np.ascontiguousarray(arr), _cv2.COLOR_RGB2BGR)
+        except Exception:
+            arr = _np.ascontiguousarray(arr)   # 連 cvtColor 都崩就原样喂，至少还能识别黑白文字
+    else:
+        arr = _np.ascontiguousarray(arr)
+    return _rapid_ocr(arr, *args, **kwargs)
 
 # =============================================================================
 # 2. CONFIGURATION & STATE MANAGEMENT
@@ -158,29 +223,36 @@ LAST_SIDEBAR_HASH = None
 LAST_FULL_SCAN_TIME = 0
 
 def load_config():
+    """
+    读配置。优先级：插件下发的内存覆盖 > DATA_DIR/config.json > 内置默认。
+    ⚠️ 默认值里**不放任何示例好友名** —— 旧版默认 ["好友A","好友B"] 会让人误以为
+       配置读到了，实际是占位符。白名单为空就是空，没配就是没配。
+    """
+    cfg = None
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
+                cfg = json.load(f)
+        except Exception as e:
+            log(f"⚠️ [配置读取失败] {CONFIG_FILE}: {e}", "warn")
+    if cfg is None:
+        if not os.path.exists(CONFIG_FILE):
+            log(f"⚠️ [配置文件不存在] {CONFIG_FILE} —— 白名单为空，不会回复任何人。"
+                f"去设置页填白名单，或用 --data-dir 指向正确目录", "warn")
+        cfg = {}
+    if _RUNTIME_OVERRIDES:
+        cfg = {**cfg, **{k: v for k, v in _RUNTIME_OVERRIDES.items() if v is not None}}
     return {
         "whitelist_mode": True,
-        "whitelist": ["好友A", "好友B"],
+        "whitelist": [],
         "group_whitelist": [],
         "blacklist": ["文件传输助手", "微信团队", "订阅号", "公众号", "服务号"],
-        "ai_engine": "openai_api",
-        "openai_api": {
-            "api_key": "",
-            "api_base": "https://api.xiaomimimo.com/v1",
-            "model": "mimo-v2.6-flash",
-            "temperature": 0.7
-        },
-        "system_prompt": "你现在是微信账号的主人（真实本人）。请以我（主人本人）的第一人称、自然口语、亲切随和的日常语气直接回复微信好友的消息。就像我本人在用手机打字聊天一样自然。严禁透露任何AI、机器人或助理身份，严禁使用客套机械的客服腔，严禁输出任何解释或markdown格式，直接输出我回复的那句话。",
         "reply_delay_seconds": 0.0,
         "check_interval_seconds": 0.8,
         "ignored_keywords": ["按住鼠标", "语音输入文字", "按住说话", "按Enter发送", "发送(S)"],
-        "friend_personas": {}
+        "friend_personas": {},
+        "group_personas": {},
+        **cfg,
     }
 
 def load_convo_map():

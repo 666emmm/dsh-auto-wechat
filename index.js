@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { loadHostDeps } from './lib/hostdeps.mjs'
 import { createBridge } from './lib/bridge.mjs'
+import { createSessionHub } from './lib/sessions.mjs'
 import { checkDeps, downloadDeps, removeDeps, DEFAULT_MIRRORS } from './lib/deps.mjs'
 
 // ⭐ schemastery 从宿主树里取（拿不到就是 undefined —— 插件照常加载，只是没有 Config，
@@ -34,6 +35,15 @@ const API = '/api/dsh-auto-wechat'
 export function stateDir() {
   const home = process.env.DSH_HOME || join(homedir(), '.dsh')
   return join(home, 'integrations', 'dsh-auto-wechat')
+}
+
+/**
+ * 微信会话的 cwd —— 一个空目录。
+ * 跟运行时（D:\ai\auto-wechat，330MB python+venv）分开：
+ * 会话的 cwd 就是模型默认会 ls/glob 的地方，指到运行时会让它白翻两万个文件。
+ */
+export function sessionsDir() {
+  return process.env.DSH_AUTO_WECHAT_SESSIONS || 'D:\\ai\\auto-wechat-sessions'
 }
 
 /**
@@ -171,12 +181,36 @@ export async function apply(ctx, rawConfig = {}) {
     mirror: String(savedRuntime.mirror ?? cfg.mirror ?? DEFAULT_MIRRORS[0].index),
   }
 
-  // 首次加载：把旧项目的 wechat_config_dev.json 迁过来当种子（清掉 api_key 之类的敏感项）
+  // 首次加载：生成空白配置骨架（不读旧项目目录 —— 那个要删的）
   bootstrapConfigFromLegacy(runtime, logger)
 
-  const bridge = createBridge({ ctx, logger, packageDir: PKG_DIR, config: runtime })
+  // 会话 cwd：空目录，专给微信会话用。
+  // 不用 D:\ai\auto-wechat（那是 330MB 运行时，模型会误翻）；
+  // 也不用 D:\大D老师（会跟你的 30 个会话混在一起）。
+  const sessionsCwd = process.env.DSH_AUTO_WECHAT_SESSIONS || sessionsDir()
+  try { mkdirSync(sessionsCwd, { recursive: true }) } catch { /* 建不出来就在 create 时报错 */ }
 
+  const hub = createSessionHub({ ctx, logger, sessionsCwd })
+
+  const bridge = createBridge({
+    ctx,
+    logger,
+    packageDir: PKG_DIR,
+    config: runtime,
+    dataDir: stateDir(),
+    hub,
+  })
+
+  // 收会话回复
+  ctx.effect(() => hub.attachListeners(), 'dsh-auto-wechat: 会话回复收集')
   ctx.effect(() => () => bridge.dispose(), 'dsh-auto-wechat: python 子进程')
+  ctx.effect(() => () => hub.dispose(), 'dsh-auto-wechat: 会话绑定')
+
+  // 插件加载时先把工作区准备好（异步，失败不影响加载）
+  void hub.ensureWorkspace().then((id) => {
+    if (id) logger.info?.(`[dsh-auto-wechat] 工作区「微信」就绪 → ${sessionsCwd}`)
+    else logger.warn?.('[dsh-auto-wechat] 工作区未建立，会话会落到「未分组」')
+  }).catch(() => {})
 
   // ── 设置页 HTTP 接口 ───────────────────────────────────────────────
   const routes = {
