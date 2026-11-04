@@ -101,6 +101,27 @@ function saveConfigFile(patch) {
 }
 
 /**
+ * 环境路径单独存一个文件。
+ * 为什么不合进 config.json：那份是「人设/白名单」，用户可能在别处改它；
+ * 环境路径属于机器相关的运行时设置，跟业务配置混在一起容易互相覆盖。
+ */
+function envPathFile() { return join(stateDir(), 'runtime.json') }
+
+function loadRuntimeFile() {
+  const p = envPathFile()
+  if (!existsSync(p)) return {}
+  try { return JSON.parse(readFileSync(p, 'utf8')) } catch { return {} }
+}
+
+function saveRuntimeFile(patch) {
+  const p = envPathFile()
+  mkdirSync(stateDir(), { recursive: true })
+  const next = { ...loadRuntimeFile(), ...patch }
+  writeFileSync(p, JSON.stringify(next, null, 2), 'utf8')
+  return next
+}
+
+/**
  * 默认值单列一份，不靠 schema 反查。
  * 为什么：volatile 字段在 schema 里会被包成 { get, [volatile.write] } 形态，
  * 而 apply(ctx, config) 收到的是 loader 校验后的**纯值**。
@@ -136,15 +157,18 @@ export async function apply(ctx, rawConfig = {}) {
 
   const cfg = normalize(rawConfig, DEFAULTS)
 
+  // runtime.json 里的值优先于 Config 默认值 —— 设置页填的路径重启后仍然有效
+  const savedRuntime = loadRuntimeFile()
+
   const runtime = {
     pythonPath: String(cfg.pythonPath ?? 'auto'),
-    envPath: String(cfg.envPath ?? ''),
-    installDir: String(cfg.installDir ?? ''),
+    envPath: String(savedRuntime.envPath ?? cfg.envPath ?? ''),
+    installDir: String(savedRuntime.installDir ?? cfg.installDir ?? ''),
     checkInterval: clampNumber(cfg.checkInterval, 0.2, 10, 0.5),
     autoReply: cfg.autoReply !== false,
     autoReplyGroup: cfg.autoReplyGroup === true,
     readOnly: cfg.readOnly === true,
-    mirror: String(cfg.mirror ?? DEFAULT_MIRRORS[0].index),
+    mirror: String(savedRuntime.mirror ?? cfg.mirror ?? DEFAULT_MIRRORS[0].index),
   }
 
   // 首次加载：把旧项目的 wechat_config_dev.json 迁过来当种子（清掉 api_key 之类的敏感项）
@@ -199,10 +223,16 @@ export async function apply(ctx, rawConfig = {}) {
     'GET /deps': () => checkDeps({ envPath: runtime.envPath, installDir: runtime.installDir }),
 
     // 保存路径 / 安装位置 / 安装源 —— 改完立刻重新检测，界面能看到结果
+    // ⚠️ 必须落盘：只存内存的话，重启 DSH 就丢，用户得重填一次
     'POST /deps/config': async (body) => {
       if (typeof body?.envPath === 'string') runtime.envPath = body.envPath.trim()
       if (typeof body?.installDir === 'string') runtime.installDir = body.installDir.trim()
       if (typeof body?.mirror === 'string' && body.mirror.trim()) runtime.mirror = body.mirror.trim()
+      saveRuntimeFile({
+        envPath: runtime.envPath,
+        installDir: runtime.installDir,
+        mirror: runtime.mirror,
+      })
       return { ok: true, ...(await checkDeps({ envPath: runtime.envPath, installDir: runtime.installDir })) }
     },
 
@@ -211,6 +241,11 @@ export async function apply(ctx, rawConfig = {}) {
       if (typeof body?.envPath === 'string') runtime.envPath = body.envPath.trim()
       if (typeof body?.installDir === 'string') runtime.installDir = body.installDir.trim()
       if (typeof body?.mirror === 'string' && body.mirror.trim()) runtime.mirror = body.mirror.trim()
+      saveRuntimeFile({
+        envPath: runtime.envPath,
+        installDir: runtime.installDir,
+        mirror: runtime.mirror,
+      })
       const lines = []
       const r = await downloadDeps(
         { envPath: runtime.envPath, installDir: runtime.installDir, mirror: runtime.mirror },
@@ -330,36 +365,35 @@ export async function apply(ctx, rawConfig = {}) {
  * ⚠️ 只搬业务字段；api_key / openai_api / system_prompt 之外的东西一律不要 ——
  *    那个 json 里有明文 key，搬过来等于泄露进插件状态。
  */
+/**
+ * 首次加载时生成一份空白配置骨架。
+ *
+ * ⚠️ 2026-11-04 改：不再从旧项目目录读配置。
+ *    那个目录是过渡用的，验证完要删；插件不能有任何指向它的运行时依赖。
+ *    现有配置已经迁移过一次（config.json 存在），这里只在完全空库时兜底。
+ */
 function bootstrapConfigFromLegacy(runtime, logger) {
   const target = configPath()
   if (existsSync(target)) return
 
-  const legacyCandidates = [
-    'D:\\ai\\wechat-autoreply\\wechat_config_dev.json',
-    join(stateDir(), 'legacy-beacon.json'),
-  ]
-  const src = legacyCandidates.find((p) => existsSync(p))
-  if (!src) return
-
+  const seed = {
+    system_prompt: '',
+    group_system_prompt: '',
+    friend_personas: {},
+    group_personas: {},
+    whitelist: [],
+    group_whitelist: [],
+    blacklist: ['微信团队', '文件传输助手', '腾讯新闻', '微信支付', '服务通知', '订阅号消息'],
+    check_interval_seconds: 0.5,
+    reply_delay_seconds: 0,
+    reply_prefix: '',
+    include_prefix: false,
+  }
   try {
-    const raw = JSON.parse(readFileSync(src, 'utf8'))
-    const seed = {
-      system_prompt: typeof raw.system_prompt === 'string' ? raw.system_prompt : '',
-      group_system_prompt: typeof raw.group_system_prompt === 'string' ? raw.group_system_prompt : '',
-      friend_personas: raw.friend_personas && typeof raw.friend_personas === 'object' ? raw.friend_personas : {},
-      group_personas: raw.group_personas && typeof raw.group_personas === 'object' ? raw.group_personas : {},
-      whitelist: Array.isArray(raw.whitelist) ? raw.whitelist : [],
-      group_whitelist: Array.isArray(raw.group_whitelist) ? raw.group_whitelist : [],
-      blacklist: Array.isArray(raw.blacklist) ? raw.blacklist : [],
-      check_interval_seconds: Number(raw.check_interval_seconds) || 0.5,
-      reply_delay_seconds: Number(raw.reply_delay_seconds) || 0,
-      reply_prefix: typeof raw.reply_prefix === 'string' ? raw.reply_prefix : '',
-      include_prefix: raw.include_prefix === true,
-    }
     mkdirSync(stateDir(), { recursive: true })
     writeFileSync(target, JSON.stringify(seed, null, 2), 'utf8')
-    logger.info?.(`[dsh-auto-wechat] 已从旧配置迁入人设与白名单（api_key 未迁移）：${src}`)
+    logger.info?.('[dsh-auto-wechat] 已生成空白配置骨架，人设和白名单请到设置页填写')
   } catch (e) {
-    logger.warn?.(`[dsh-auto-wechat] 迁移旧配置失败：${e?.message ?? e}`)
+    logger.warn?.(`[dsh-auto-wechat] 生成配置骨架失败：${e?.message ?? e}`)
   }
 }

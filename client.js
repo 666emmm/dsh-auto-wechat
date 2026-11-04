@@ -244,7 +244,7 @@ window.__ModuleLoader__.load({
                 style: { ...css.input, minWidth: 0 },
                 value: envPath, onChange: (e) => setEnvPath(e.target.value),
                 onKeyDown: (e) => { if (e.key === 'Enter') onSavePath() },
-                placeholder: 'D:\\ai\\wechat-autoreply\\.venv',
+                placeholder: 'D:\\ai\\auto-wechat\\venv',
               }),
               h('button', { style: css.btn(false), onClick: onSavePath, disabled: checking },
                 checking ? '检测中…' : '检测'))),
