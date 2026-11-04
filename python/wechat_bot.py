@@ -1581,7 +1581,7 @@ def scan_and_reply_wechat(hwnd):
                 #
                 # 现在：只留「谁 + 说了什么」。这才是"这条消息处理过没有"的真正依据。
                 # 连发聚合时 combined_text 本身就是稳定的（多句拼接结果一致）。
-                current_sig = (current_active_target, combined_text)
+                current_sig = (current_active_target, _normalize_sig_text(combined_text))
                 # 两道闸，都带时间窗（默认 12 秒）：
                 #   ① 签名相同    = 这条内容刚处理过 → 跳过
                 #   ② 文本等于最后处理的那句 → 判定为气泡滚动/重排导致的重复识别 → 跳过
@@ -1589,15 +1589,21 @@ def scan_and_reply_wechat(hwnd):
                 # 为什么必须带时间窗：对方完全可能过一会儿真的又说了同一句话
                 # （"在吗" → 回复 → 十分钟后又"在吗"），那时必须正常回。
                 # 没有时间窗就会被永久拦住，表现为"偶尔不回消息"。
+                # ⚠️ 时间窗不能用小的（2026-11-04 用户实测）：
+                # 主循环一轮约 13~14 秒（OCR 慢），而之前窗口只有 12 秒，
+                # 于是每轮都"过期"→ 同一句话被判成新消息 4 次。
+                # 正确的语义是：**这些气泡还在屏幕上，就一直算处理过**。
+                # 所以改成按内容持久去重（10 分钟窗口），
+                # 只有出现不同的文本才更新。
                 now_ts = time.time()
-                fresh = now_ts - LAST_PROCESSED_AT.get(current_active_target, 0) < 12.0
+                DEDUPE_WINDOW = 600.0
                 sig_same = (
                     LAST_PROCESSED_SIGNATURE.get(current_active_target) == current_sig
-                    and fresh
+                    and now_ts - LAST_PROCESSED_AT.get(current_active_target, 0) < DEDUPE_WINDOW
                 )
                 text_same = (
                     LAST_REPLIED_TEXT.get(current_active_target) == combined_text
-                    and now_ts - LAST_REPLIED_AT.get(current_active_target, 0) < 12.0
+                    and now_ts - LAST_REPLIED_AT.get(current_active_target, 0) < DEDUPE_WINDOW
                 )
                 if not (sig_same or text_same):
                     
@@ -1624,7 +1630,7 @@ def scan_and_reply_wechat(hwnd):
                                     pending_bubbles = pending_lat
                                     combined_text = combined_lat
                                     # 同上：签名只留「谁 + 说了什么」，不带像素坐标
-                                    current_sig = (current_active_target, combined_text)
+                                    current_sig = (current_active_target, _normalize_sig_text(combined_text))
                             
                     log(f"\n📩 [当前会话锁定·连发聚合] 收到当前好友【{current_active_target}】新消息({len(pending_bubbles)}条): \"{combined_text}\"")
 
@@ -1761,6 +1767,31 @@ def emit_state(hwnd, ver):
         except Exception:
             size = ""
     emit({"t": "state", "hwnd": int(hwnd or 0), "wxver": int(ver or 0), "window": size})
+
+def _normalize_sig_text(text):
+    """
+    消息文本归一化 —— 只留汉字/字母/数字，抹平一切 OCR 标点抖动。
+
+    ── 2026-11-04 为什么需要这层 ──
+    群聊消息的 OCR 结果在两种形态间来回跳：
+        "晨起望秋凉，现在可以了吗"    ← 逗号
+        "晨起望秋凉：现在可以了吗"    ← 全角冒号
+    原因：parse_chat_bubbles_chromatic 里 sender 名字是单独一行 OCR，
+    有时能配对上（进 sender_name 字段），有时配不上（混进正文、带冒号）。
+    签名用原始文本就会每轮都不同 → 同一条消息无限重复上报。
+
+    所以签名前把**所有标点和空白都抹掉**，只比较实词序列。
+    实测这两种形态归一后完全相同：
+        晨起望秋凉，现在可以了吗 → 晨起望秋凉现在可以了吗
+        晨起望秋凉：现在可以了吗 → 晨起望秋凉现在可以了吗
+
+    注意：这只影响"是不是同一条消息"的判断，**不影响实际发给微信的内容**。
+    """
+    if not text:
+        return ""
+    import re as _re
+    return _re.sub(r'[^0-9A-Za-z\u4e00-\u9fff]', '', str(text)).lower()
+
 
 def emit_observed(conv, kind, bubbles, combined_text):
     """

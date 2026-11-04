@@ -192,6 +192,26 @@ window.__ModuleLoader__.load({
         if (status?.recentLog) setLogLines(status.recentLog)
       }, [status])
 
+      // ⭐ 自动刷新：状态 + 日志每 1.5 秒拉一次。
+      //    之前只在挂载时拉一次，所以"必须关掉设置页再打开"才看到新日志。
+      //    用 ref 存定时器，组件卸载时清掉，避免面板切走后还在打请求。
+      const pollRef = useRef(null)
+      useEffect(() => {
+        let alive = true
+        const tick = async () => {
+          if (!alive) return
+          try {
+            const s = await rpc('status', {})
+            if (alive && s?.ok && s.recentLog) setLogLines(s.recentLog)
+          } catch { /* 网络抖动忽略，下一轮再来 */ }
+        }
+        pollRef.current = setInterval(tick, 1500)
+        return () => {
+          alive = false
+          if (pollRef.current) clearInterval(pollRef.current)
+        }
+      }, [rpc])
+
       const running = Boolean(status?.running)
       const ready = Boolean(status?.ready)
 
