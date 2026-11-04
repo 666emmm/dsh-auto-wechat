@@ -23,17 +23,19 @@ window.__ModuleLoader__.load({
               ? ['POST', '/switch']
               : method === 'depsCheck'
                 ? ['GET', '/deps']
-                : method === 'depsDownload'
-                  ? ['POST', '/deps/download']
-                  : method === 'depsRemove'
-                    ? ['POST', '/deps/remove']
-                    : method === 'clearLog'
-                      ? ['POST', '/log/clear']
-                      : method === 'exportLog'
-                        ? ['GET', '/log/export']
-                        : method === 'start' || method === 'stop'
-                          ? ['POST', `/${method}`]
-                          : ['GET', `/${method}`]
+                : method === 'depsConfig'
+                  ? ['POST', '/deps/config']
+                  : method === 'depsDownload'
+                    ? ['POST', '/deps/download']
+                    : method === 'depsRemove'
+                      ? ['POST', '/deps/remove']
+                      : method === 'clearLog'
+                        ? ['POST', '/log/clear']
+                        : method === 'exportLog'
+                          ? ['GET', '/log/export']
+                          : method === 'start' || method === 'stop'
+                            ? ['POST', `/${method}`]
+                            : ['GET', `/${method}`]
         try {
           if (verb === 'GET') {
             return await asJson(await fetch(API + path, { credentials: 'same-origin' }))
@@ -148,12 +150,21 @@ window.__ModuleLoader__.load({
     // ── 概览 ─────────────────────────────────────────────────────────
     function Overview({ rpc, status, refresh, busy }) {
       const [deps, setDeps] = useState(null)
+      const [envPath, setEnvPath] = useState('')
+      const [installDir, setInstallDir] = useState('')
       const [mirror, setMirror] = useState('')
+      const [checking, setChecking] = useState(false)
       const [logLines, setLogLines] = useState([])
 
       useEffect(() => {
         let alive = true
-        rpc('depsCheck', {}).then((r) => { if (alive && r?.ok) { setDeps(r); setMirror(r.mirror ?? '') } })
+        rpc('depsCheck', {}).then((r) => {
+          if (!alive || !r?.ok) return
+          setDeps(r)
+          setEnvPath(r.envPath ?? '')
+          setInstallDir(r.installDir ?? '')
+          setMirror((r.mirrors?.[0]?.index) ?? '')
+        })
         return () => { alive = false }
       }, [rpc])
 
@@ -164,10 +175,19 @@ window.__ModuleLoader__.load({
       const running = Boolean(status?.running)
       const ready = Boolean(status?.ready)
 
-      const onDownload = async () => {
-        await rpc('depsDownload', { mirror })
-        const r = await rpc('depsCheck', {})
+      // 保存路径并立刻重新检测 —— 这一步只读，不下载
+      const onSavePath = async () => {
+        setChecking(true)
+        const r = await rpc('depsConfig', { envPath, installDir, mirror })
         if (r?.ok) setDeps(r)
+        setChecking(false)
+      }
+      const onDownload = async () => {
+        setChecking(true)
+        const r = await rpc('depsDownload', { envPath, installDir, mirror })
+        const c = await rpc('depsCheck', {})
+        if (c?.ok) setDeps(c)
+        setChecking(false)
         refresh()
       }
       const onRemove = async () => {
@@ -209,19 +229,79 @@ window.__ModuleLoader__.load({
           }, h(Switch, { on: Boolean(status?.switches?.autoReplyGroup), onChange: (v) => rpc('setSwitch', { autoReplyGroup: v }).then(refresh) })),
         ),
 
-        h(Card, { title: '依赖项', hint: deps?.hint || '检测中…' },
-          h(Row, { title: 'Python 运行时', desc: deps?.root || '' },
-            h('span', { style: css.badge(deps?.installed ? 'g' : 'w') },
-              deps?.installed ? '已下载' : '需要下载')),
-          h(Row, { title: '下载地址', desc: '装依赖用的 pip 源；国内建议清华或阿里云' },
+        h(Card, {
+          title: 'Python 环境',
+          hint: deps?.hint || '检测中…',
+        },
+          // ① 本机已有环境：填路径，检测通过就直接用，一个字节都不用下
+          h(Row, {
+            title: '本机环境路径',
+            desc: '电脑上已有的 Python 环境。venv 根目录、Scripts\\python.exe、或 CPython 安装目录都认。'
+              + '填对了就直接用，不会重复下载',
+          },
+            h('div', { style: { display: 'flex', gap: 6, minWidth: 0, flex: 1 } },
+              h('input', {
+                style: { ...css.input, minWidth: 0 },
+                value: envPath, onChange: (e) => setEnvPath(e.target.value),
+                onKeyDown: (e) => { if (e.key === 'Enter') onSavePath() },
+                placeholder: 'D:\\ai\\wechat-autoreply\\.venv',
+              }),
+              h('button', { style: css.btn(false), onClick: onSavePath, disabled: checking },
+                checking ? '检测中…' : '检测'))),
+
+          // ② 检测结果
+          h(Row, {
+            title: '检测结果',
+            desc: deps
+              ? (deps.usable
+                  ? `Python ${deps.pythonVersion || '?'} · ${deps.pythonPath}`
+                  : (deps.pythonPath ? `${deps.pythonPath}（不可用）` : '未找到可用环境'))
+              : '—',
+          },
+            h('span', { style: css.badge(deps?.usable ? 'g' : deps?.pythonPath ? 'w' : undefined) },
+              deps?.usable ? '✓ 可用' : deps?.pythonPath ? '缺依赖' : '未找到')),
+
+          // ③ 没有环境时才需要下载；而且位置可自定义
+          h(Row, {
+            title: '安装位置',
+            desc: '只有在「本机环境路径」为空、或那套环境要补包时才用得上',
+          },
+            h('div', { style: { display: 'flex', gap: 6, minWidth: 0, flex: 1 } },
+              h('input', {
+                style: { ...css.input, minWidth: 0 },
+                value: installDir, onChange: (e) => setInstallDir(e.target.value),
+                placeholder: deps?.installDir || '%LOCALAPPDATA%\\dsh-auto-wechat',
+              }))),
+
+          h(Row, {
+            title: '安装源',
+            desc: '补包时用的 pip 源；已装好就无关紧要',
+          },
             h('input', {
-              style: css.input, value: mirror, onChange: (e) => setMirror(e.target.value),
+              style: { ...css.input, minWidth: 0 },
+              value: mirror, onChange: (e) => setMirror(e.target.value),
               placeholder: 'https://pypi.tuna.tsinghua.edu.cn/simple',
             })),
-          h(Row, { title: '操作', desc: '第一次要下约 330MB；删了下次还得重下', last: true },
+
+          h(Row, {
+            title: '操作',
+            desc: deps?.usable
+              ? '环境已可用，什么都不用做'
+              : (deps?.pythonPath ? '补装缺的包到这套环境里' : '没填路径时才会真的下载（约 330MB）'),
+            last: true,
+          },
             h('div', { style: { display: 'flex', gap: 8 } },
-              h('button', { style: css.btn(true), onClick: onDownload }, deps?.installed ? '重新下载' : '下载依赖'),
-              h('button', { style: css.btn(false), onClick: onRemove, disabled: !deps?.installed }, '删除依赖'))),
+              h('button', {
+                style: css.btn(true),
+                onClick: onDownload,
+                disabled: checking || Boolean(deps?.usable),
+              }, deps?.usable ? '无需操作' : (deps?.pythonPath ? '补齐依赖' : '下载依赖')),
+              h('button', {
+                style: css.btn(false),
+                onClick: onRemove,
+                disabled: !deps?.installed || deps?.source === 'user',
+                title: deps?.source === 'user' ? '本机环境不会删' : '',
+              }, '删除'))),
         ),
 
         h(Card, { title: '实时日志' },

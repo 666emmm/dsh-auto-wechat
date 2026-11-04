@@ -45,12 +45,15 @@ export function stateDir() {
  */
 export const Config = !z ? undefined : z.object({
   pythonPath: z.string().default('auto').extra('volatile', true),
-  runtimeDir: z.string().default('').extra('volatile', true),
+  // 本机已有的 Python 环境路径（venv 根目录 / Scripts\python.exe / CPython 目录都认）
+  envPath: z.string().default('').extra('volatile', true),
+  // 没填 envPath 时，下载依赖装到这里
+  installDir: z.string().default('').extra('volatile', true),
   checkInterval: z.number().default(0.5).extra('volatile', true),
   autoReply: z.boolean().default(true).extra('volatile', true),
   autoReplyGroup: z.boolean().default(false).extra('volatile', true),
   readOnly: z.boolean().default(false).extra('volatile', true),
-  mirror: z.string().default(DEFAULT_MIRRORS[1].index).extra('volatile', true),
+  mirror: z.string().default(DEFAULT_MIRRORS[0].index).extra('volatile', true),
 })
 
 function clampNumber(v, min, max, fallback) {
@@ -105,12 +108,13 @@ function saveConfigFile(patch) {
  */
 const DEFAULTS = {
   pythonPath: 'auto',
-  runtimeDir: '',
+  envPath: '',
+  installDir: '',
   checkInterval: 0.5,
   autoReply: true,
   autoReplyGroup: false,
   readOnly: false,
-  mirror: DEFAULT_MIRRORS[1].index,
+  mirror: DEFAULT_MIRRORS[0].index,
 }
 
 function normalize(src, base) {
@@ -134,12 +138,13 @@ export async function apply(ctx, rawConfig = {}) {
 
   const runtime = {
     pythonPath: String(cfg.pythonPath ?? 'auto'),
-    runtimeDir: String(cfg.runtimeDir ?? ''),
+    envPath: String(cfg.envPath ?? ''),
+    installDir: String(cfg.installDir ?? ''),
     checkInterval: clampNumber(cfg.checkInterval, 0.2, 10, 0.5),
     autoReply: cfg.autoReply !== false,
     autoReplyGroup: cfg.autoReplyGroup === true,
     readOnly: cfg.readOnly === true,
-    mirror: String(cfg.mirror ?? DEFAULT_MIRRORS[1].index),
+    mirror: String(cfg.mirror ?? DEFAULT_MIRRORS[0].index),
   }
 
   // 首次加载：把旧项目的 wechat_config_dev.json 迁过来当种子（清掉 api_key 之类的敏感项）
@@ -190,19 +195,34 @@ export async function apply(ctx, rawConfig = {}) {
     'POST /start': () => bridge.start(),
     'POST /stop': () => bridge.stop(),
 
-    'GET /deps': () => checkDeps({ runtimeDir: runtime.runtimeDir, mirror: runtime.mirror }),
+    // 检测：只读地回答问题「这个路径能不能用」，不下载、不落盘
+    'GET /deps': () => checkDeps({ envPath: runtime.envPath, installDir: runtime.installDir }),
 
+    // 保存路径 / 安装位置 / 安装源 —— 改完立刻重新检测，界面能看到结果
+    'POST /deps/config': async (body) => {
+      if (typeof body?.envPath === 'string') runtime.envPath = body.envPath.trim()
+      if (typeof body?.installDir === 'string') runtime.installDir = body.installDir.trim()
+      if (typeof body?.mirror === 'string' && body.mirror.trim()) runtime.mirror = body.mirror.trim()
+      return { ok: true, ...(await checkDeps({ envPath: runtime.envPath, installDir: runtime.installDir })) }
+    },
+
+    // 安装/补齐：用户填了路径 → 只补缺的包进那套环境；没填 → 装到 installDir
     'POST /deps/download': async (body) => {
-      if (body?.mirror) runtime.mirror = String(body.mirror)
+      if (typeof body?.envPath === 'string') runtime.envPath = body.envPath.trim()
+      if (typeof body?.installDir === 'string') runtime.installDir = body.installDir.trim()
+      if (typeof body?.mirror === 'string' && body.mirror.trim()) runtime.mirror = body.mirror.trim()
       const lines = []
       const r = await downloadDeps(
-        { runtimeDir: runtime.runtimeDir, mirror: runtime.mirror },
+        { envPath: runtime.envPath, installDir: runtime.installDir, mirror: runtime.mirror },
         (l) => { lines.push(l); logger.info?.(`[deps] ${l}`) },
       )
       return { ...r, lines }
     },
 
-    'POST /deps/remove': () => removeDeps({ runtimeDir: runtime.runtimeDir }, (l) => logger.info?.(`[deps] ${l}`)),
+    'POST /deps/remove': () => removeDeps(
+      { envPath: runtime.envPath, installDir: runtime.installDir },
+      (l) => logger.info?.(`[deps] ${l}`),
+    ),
 
     'POST /log/clear': () => { bridge.clearLog(); return { ok: true } },
 
