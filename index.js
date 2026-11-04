@@ -313,13 +313,15 @@ export async function apply(ctx, rawConfig = {}) {
       (l) => logger.info?.(`[deps] ${l}`),
     ),
 
-    // 清会话：先清幽灵（账面有、实体没了），再归档真空会话（blank=true）
-    // 有聊天记录的绝不碰
+    // 清会话：幽灵 → 空会话 → 同标题去重（三步，越靠后越谨慎）
     'POST /sessions/prune': async () => {
+      const dupes = await hub.dedupeByTitle()
       const ghosts = await hub.pruneGhosts()
       const blanks = await hub.pruneUnbound()
       return {
         ok: true,
+        deduped: dupes?.archived ?? [],
+        kept: dupes?.kept ?? [],
         ghosts: ghosts?.removed ?? [],
         ghostSkipped: ghosts?.skipped ?? [],
         archived: blanks?.archived ?? [],
