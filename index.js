@@ -216,6 +216,11 @@ export async function apply(ctx, rawConfig = {}) {
         return
       }
       logger.info?.(`[dsh-auto-wechat] 工作区「微信」就绪 → ${sessionsCwd}`)
+      // 先对账：把"已归档但还在 sessionIds 里"的剔掉，否则会被当成正常会话显示
+      const rec = await hub.reconcileArchive()
+      if (rec?.ok && rec.removed?.length) {
+        logger.info?.(`[dsh-auto-wechat] 对账：移除 ${rec.removed.length} 个已归档会话`)
+      }
       const r = await hub.adoptOrphans()
       if (r?.ok && r.moved?.length) {
         logger.info?.(`[dsh-auto-wechat] 认领 ${r.moved.length} 个游离会话进「微信」工作区`)
