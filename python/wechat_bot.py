@@ -148,6 +148,26 @@ def acquire_singleton(name="Global\\DshAutoWechatDaemon"):
         return True
 
 def init_ocr():
+    """
+    初始化本地 OCR 引擎。
+
+    ── 2026-11-05 必须限制线程数（用户报告 DSH 界面卡顿）──
+    这台机器有 32 个逻辑处理器。onnxruntime 的 InferenceSession 默认
+    intra_op_num_threads = CPU 核数，并且用自旋等待（busy-wait）同步线程。
+    实测守护进程每 10 秒吃掉 156 秒 CPU ≈ 15.7 个核心常驻满载，
+    表现就是整个系统时不时卡几秒 —— 用户的 DSH 界面上下滑都卡。
+
+    OCR 是 CPU 密集但**不需要并发**的任务：一次只处理一张截图。
+    给 2 个线程足够，多给的只会抢别的进程的 CPU。
+    """
+    # 必须在 import/构造 InferenceSession 之前设好环境变量
+    for _k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+               "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ.setdefault(_k, "2")
+    # onnxruntime 自己认这两个
+    os.environ.setdefault("ORT_INTRA_OP_NUM_THREADS", "2")
+    os.environ.setdefault("ORT_INTER_OP_NUM_THREADS", "1")
+
     models_dir = os.path.join(BASE_DIR, "models")
     if not os.path.exists(models_dir):
         models_dir = os.path.join(BASE_DIR, "_internal", "models")
@@ -155,12 +175,31 @@ def init_ocr():
     det_model = os.path.join(models_dir, "ch_PP-OCRv4_det_infer.onnx")
     cls_model = os.path.join(models_dir, "ch_ppocr_mobile_v2.0_cls_infer.onnx")
     rec_model = os.path.join(models_dir, "ch_PP-OCRv4_rec_infer.onnx")
-    
+
+    # rapidocr 支持直接传线程参数；不同版本名字略有差异，逐个试
+    thread_kwargs = (
+        {"intra_op_num_threads": 2, "inter_op_num_threads": 1},
+        {"intra_op_num_threads": 2},
+        {},
+    )
+
+    def _build(**model_paths):
+        for kw in thread_kwargs:
+            try:
+                return RapidOCR(**model_paths, **kw)
+            except TypeError:
+                continue          # 这个版本不认这些参数
+            except Exception:
+                break
+        return None
+
     if os.path.exists(det_model) and os.path.exists(rec_model):
-        try:
-            return RapidOCR(det_model_path=det_model, cls_model_path=cls_model, rec_model_path=rec_model)
-        except Exception:
-            pass
+        eng = _build(det_model_path=det_model, cls_model_path=cls_model, rec_model_path=rec_model)
+        if eng is not None:
+            return eng
+    eng = _build()
+    if eng is not None:
+        return eng
     return RapidOCR()
 
 # Initialize local neural network OCR engine
