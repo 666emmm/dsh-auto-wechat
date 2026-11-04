@@ -213,6 +213,12 @@ def ocr_engine(img, *args, **kwargs):
 # 2. CONFIGURATION & STATE MANAGEMENT
 # =============================================================================
 LAST_PROCESSED_SIGNATURE = {}
+# 每个对话最后处理过的时间。签名必须配时间窗，否则"对方隔很久又说同一句话"
+# 会被永久拦住（表现为偶尔不回消息）。
+LAST_PROCESSED_AT = {}
+# 每个对话最后处理过的文本 + 时间，用途同上（防气泡滚动重识别）
+LAST_REPLIED_TEXT = {}
+LAST_REPLIED_AT = {}
 API_CONVERSATION_HISTORY = {}
 LAST_CLICKED_CANDIDATE_TIME = {}
 SEND_FAIL_RETRY = {}
@@ -1566,8 +1572,34 @@ def scan_and_reply_wechat(hwnd):
             pending_bubbles, combined_text = extract_pending_incoming_messages(chat_bubbles)
             # 🔥 第一道铁闸：只要当前好友有未回复新消息，绝对锁定在当前窗口就地秒回！
             if pending_bubbles and combined_text:
-                current_sig = (current_active_target, combined_text, int(pending_bubbles[-1]['last_y']), len(chat_bubbles))
-                if LAST_PROCESSED_SIGNATURE.get(current_active_target) != current_sig:
+                # ── 2026-11-04 修：签名不能带像素坐标，否则同一条消息会被反复上报 ──
+                # 原来：
+                #   current_sig = (target, combined_text, int(pending[-1]['last_y']), len(bubbles))
+                # last_y 是气泡的像素纵坐标，OCR 每轮抖动 ±1px 就变一次签名，
+                # 于是同一条消息被无限重复上报（用户看到"一直在识别私聊和群聊"）。
+                # 而且一旦回复后气泡滚动，last_y 全变，历史消息会再触发一遍。
+                #
+                # 现在：只留「谁 + 说了什么」。这才是"这条消息处理过没有"的真正依据。
+                # 连发聚合时 combined_text 本身就是稳定的（多句拼接结果一致）。
+                current_sig = (current_active_target, combined_text)
+                # 两道闸，都带时间窗（默认 12 秒）：
+                #   ① 签名相同    = 这条内容刚处理过 → 跳过
+                #   ② 文本等于最后处理的那句 → 判定为气泡滚动/重排导致的重复识别 → 跳过
+                #
+                # 为什么必须带时间窗：对方完全可能过一会儿真的又说了同一句话
+                # （"在吗" → 回复 → 十分钟后又"在吗"），那时必须正常回。
+                # 没有时间窗就会被永久拦住，表现为"偶尔不回消息"。
+                now_ts = time.time()
+                fresh = now_ts - LAST_PROCESSED_AT.get(current_active_target, 0) < 12.0
+                sig_same = (
+                    LAST_PROCESSED_SIGNATURE.get(current_active_target) == current_sig
+                    and fresh
+                )
+                text_same = (
+                    LAST_REPLIED_TEXT.get(current_active_target) == combined_text
+                    and now_ts - LAST_REPLIED_AT.get(current_active_target, 0) < 12.0
+                )
+                if not (sig_same or text_same):
                     
                     # 🌟 极速动态像素沉降判定 (Dynamic Pixel Settling):
                     # 短暂等待 0.35 秒 (人类打字发句最小停顿)，若右侧气泡像素无变动，立即判定单句发送完毕，0秒多余等待直接交由 AI！
@@ -1591,7 +1623,8 @@ def scan_and_reply_wechat(hwnd):
                                 if pending_lat and combined_lat:
                                     pending_bubbles = pending_lat
                                     combined_text = combined_lat
-                                    current_sig = (current_active_target, combined_text, int(pending_bubbles[-1]['last_y']), len(chat_bubbles_lat))
+                                    # 同上：签名只留「谁 + 说了什么」，不带像素坐标
+                                    current_sig = (current_active_target, combined_text)
                             
                     log(f"\n📩 [当前会话锁定·连发聚合] 收到当前好友【{current_active_target}】新消息({len(pending_bubbles)}条): \"{combined_text}\"")
 
@@ -1607,6 +1640,12 @@ def scan_and_reply_wechat(hwnd):
                         )
                         # 登记签名：同一条内容不再重复上报（配合插件侧指纹去重，双保险）
                         LAST_PROCESSED_SIGNATURE[current_active_target] = current_sig
+                        LAST_PROCESSED_AT[current_active_target] = time.time()
+                        # 额外记住"这个对话最后处理过的那句话 + 时间"。
+                        # 回复发出后气泡会滚动，OCR 可能把同一句话换个位置再识别出来；
+                        # 有了这个（带 12 秒时间窗）即使签名计算有偏差也不会重复上报。
+                        LAST_REPLIED_TEXT[current_active_target] = combined_text
+                        LAST_REPLIED_AT[current_active_target] = time.time()
                         return
 
                     ai_reply = generate_ai_reply(current_active_target, combined_text, is_group=is_group_target)
@@ -1623,6 +1662,7 @@ def scan_and_reply_wechat(hwnd):
                         success = send_reply_instant(hwnd, rect, layout, current_active_target, final_reply, is_group=is_group_target)
                         if success:
                             LAST_PROCESSED_SIGNATURE[current_active_target] = current_sig
+                            LAST_PROCESSED_AT[current_active_target] = time.time()
                             SEND_FAIL_RETRY.pop(current_sig, None)
                         else:
                             fail_count = SEND_FAIL_RETRY.get(current_sig, 0) + 1
@@ -1630,6 +1670,7 @@ def scan_and_reply_wechat(hwnd):
                             if fail_count >= 2:
                                 # 连续 2 次发送脱靶（如微信窗口遮挡或最小化），锁定签名放弃以防重试风暴无限消耗 API 额度
                                 LAST_PROCESSED_SIGNATURE[current_active_target] = current_sig
+                                LAST_PROCESSED_AT[current_active_target] = time.time()
                                 SEND_FAIL_RETRY.pop(current_sig, None)
                                 log(f"🚫 [重试超限熔断] 好友【{current_active_target}】消息连续 2 次发送脱靶，已放弃该条回复以防死循环。")
                             else:
@@ -1638,6 +1679,7 @@ def scan_and_reply_wechat(hwnd):
                         # 生成回复为空（如未填 Key 或 API 异常），记录告警并登记签名防空转
                         log(f"⚠️ [AI生成跳过] 好友【{current_active_target}】消息未获得有效AI回复 (API超时/网络抖动或未配Key)，登记签名防空转。")
                         LAST_PROCESSED_SIGNATURE[current_active_target] = current_sig
+                        LAST_PROCESSED_AT[current_active_target] = time.time()
 
                     # 本次已处理新消息，返回结束本轮调度
                     return
