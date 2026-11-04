@@ -31,8 +31,10 @@ window.__ModuleLoader__.load({
                       ? ['POST', '/deps/remove']
                       : method === 'sessionsPrune'
                         ? ['POST', '/sessions/prune']
-                        : method === 'sessionsList'
-                          ? ['GET', '/sessions']
+                        : method === 'sessionsInventory'
+                          ? ['GET', '/sessions/inventory']
+                          : method === 'sessionsList'
+                            ? ['GET', '/sessions']
                           : method === 'clearLog'
                             ? ['POST', '/log/clear']
                             : method === 'exportLog'
@@ -162,6 +164,7 @@ window.__ModuleLoader__.load({
       const [savedAt, setSavedAt] = useState(0)
       const [logLines, setLogLines] = useState([])
       const [sessions, setSessions] = useState([])
+      const [inventory, setInventory] = useState([])
       const [pruneMsg, setPruneMsg] = useState('')
 
       useEffect(() => {
@@ -181,6 +184,7 @@ window.__ModuleLoader__.load({
           setSaved(cur)
         })
         rpc('sessionsList', {}).then((r) => { if (alive && r?.ok) setSessions(r.sessions ?? []) })
+        rpc('sessionsInventory', {}).then((r) => { if (alive && r?.ok) setInventory(r.items ?? []) })
         return () => { alive = false }
       }, [rpc])
 
@@ -341,31 +345,41 @@ window.__ModuleLoader__.load({
 
         h(Card, {
           title: '会话',
-          hint: '一个微信对话对应一个 DSH 会话（在左侧「微信」工作区里）',
+          hint: '一个微信对话对应一个 DSH 会话（在左侧「微信」工作区里）。'
+            + '「空」是 DSH 的 blank 标记 —— 只有真空的才会被清理，有聊天记录的永远不动。',
         },
+          h('div', { style: { border: `1px solid ${T.bd1}`, borderRadius: 8, background: T.bg2, maxHeight: 190, overflowY: 'auto', padding: 4 } },
+            inventory.length
+              ? inventory.map((it) => h('div', {
+                  key: it.sessionId,
+                  style: { display: 'flex', alignItems: 'center', gap: 8, padding: '5px 8px', fontSize: 12, borderBottom: `1px dashed ${T.bd1}` },
+                },
+                  h('span', { style: css.dot(it.running ? T.warn : it.blank ? T.idle : T.ok) }),
+                  h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+                    it.conv ? `微信 · ${it.conv}` : it.sessionId),
+                  h('span', { style: css.badge(it.blank ? undefined : 'g') },
+                    it.running ? '运行中' : it.blank === true ? '空' : it.blank === null ? '未知' : '有记录')))
+              : h('div', { style: { color: T.idle, fontSize: 12, padding: '20px 8px', textAlign: 'center' } },
+                  '还没有会话 —— 微信来消息后会自动建')),
           h(Row, {
-            title: `已绑定 ${sessions.length} 个`,
-            desc: sessions.length
-              ? sessions.map((s) => `${s.conv}（${s.kind === 'group' ? '群' : '单聊'}）`).join(' · ')
-              : '还没识别到任何对话 —— 微信窗口里要先打开某个聊天',
-          },
-            h('span', { style: css.badge(sessions.length ? 'g' : undefined) },
-              sessions.length ? '正常' : '空')),
-          h(Row, {
-            title: '清理空会话',
-            desc: '早期版本重试时会给同一个对话堆出多个空会话。这里只删「没绑定、不在跑」的',
+            title: `共 ${inventory.length} 个 · 其中空会话 ${inventory.filter((x) => x.blank === true && !x.running).length} 个`,
+            desc: '清理只归档「空 + 未绑定 + 不在跑」的。有聊天记录的会被跳过，绝不会丢',
             last: true,
           },
             h('button', {
               style: css.btn(false),
               onClick: async () => {
                 const r = await rpc('sessionsPrune', {})
-                setPruneMsg(r?.ok ? `清理了 ${r.removed?.length ?? 0} 个` : `失败：${r?.error ?? ''}`)
-                const s = await rpc('sessionsList', {})
-                if (s?.ok) setSessions(s.sessions ?? [])
+                const n = r?.archived?.length ?? 0
+                const skipped = r?.skipped?.filter((s) => s.why !== '已绑定') ?? []
+                setPruneMsg(r?.ok
+                  ? `归档 ${n} 个空会话${skipped.length ? `，保留 ${skipped.length} 个（${[...new Set(skipped.map((s) => s.why))].join('/')}）` : ''}`
+                  : `失败：${r?.error ?? ''}`)
+                const inv = await rpc('sessionsInventory', {})
+                if (inv?.ok) setInventory(inv.items ?? [])
               },
-            }, '清理'))),
-        pruneMsg ? h('div', { style: { color: T.lb2, fontSize: 12 } }, pruneMsg) : null,
+            }, '清理空会话'))),
+        pruneMsg ? h('div', { style: { color: T.lb2, fontSize: 12, marginTop: -8 } }, pruneMsg) : null,
 
         h(Card, { title: '实时日志' },
           h('div', { style: css.log },

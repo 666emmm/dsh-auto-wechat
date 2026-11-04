@@ -314,6 +314,7 @@ export async function apply(ctx, rawConfig = {}) {
     ),
 
     // 清掉历史遗留的空会话（同一对话重试堆出来的那些）
+    // 只归档 blank=true 的；有聊天记录的绝不碰
     'POST /sessions/prune': () => hub.pruneUnbound(),
 
     // 当前绑定情况
@@ -323,6 +324,9 @@ export async function apply(ctx, rawConfig = {}) {
       workspaceId: hub.workspaceId,
       sessions: hub.list(),
     }),
+
+    // 工作区里的全部会话（含未绑定的历史），带 blank 标记
+    'GET /sessions/inventory': () => hub.inventory(),
 
     'POST /log/clear': () => { bridge.clearLog(); return { ok: true } },
 
