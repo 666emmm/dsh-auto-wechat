@@ -237,9 +237,16 @@ export async function apply(ctx, rawConfig = {}) {
       delete patch.api_key
       delete patch.openai_api
       const saved = saveConfigFile(patch)
-      // 配置变了立刻推给 Python，不用重启
+      // 配置变了立刻推给 Python，不用重启进程。
+      // 白名单/黑名单/模式都推 —— Python 每轮 load_config() 会重新读，
+      // 之前只推 interval，所以界面上改白名单得等重启。
       bridge.pushConfig({
         interval: clampNumber(saved.check_interval_seconds, 0.2, 10, runtime.checkInterval),
+        whitelist_mode: saved.whitelist_mode !== false,
+        whitelist: Array.isArray(saved.whitelist) ? saved.whitelist : [],
+        group_whitelist: Array.isArray(saved.group_whitelist) ? saved.group_whitelist : [],
+        blacklist: Array.isArray(saved.blacklist) ? saved.blacklist : [],
+        reply_delay_seconds: clampNumber(saved.reply_delay_seconds, 0, 60, 0),
       })
       return { ok: true, config: saved }
     },
@@ -305,6 +312,17 @@ export async function apply(ctx, rawConfig = {}) {
       { envPath: runtime.envPath, installDir: runtime.installDir },
       (l) => logger.info?.(`[deps] ${l}`),
     ),
+
+    // 清掉历史遗留的空会话（同一对话重试堆出来的那些）
+    'POST /sessions/prune': () => hub.pruneUnbound(),
+
+    // 当前绑定情况
+    'GET /sessions': () => ({
+      ok: true,
+      mode: hub.mode,
+      workspaceId: hub.workspaceId,
+      sessions: hub.list(),
+    }),
 
     'POST /log/clear': () => { bridge.clearLog(); return { ok: true } },
 

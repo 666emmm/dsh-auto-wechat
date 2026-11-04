@@ -29,13 +29,17 @@ window.__ModuleLoader__.load({
                     ? ['POST', '/deps/download']
                     : method === 'depsRemove'
                       ? ['POST', '/deps/remove']
-                      : method === 'clearLog'
-                        ? ['POST', '/log/clear']
-                        : method === 'exportLog'
-                          ? ['GET', '/log/export']
-                          : method === 'start' || method === 'stop'
-                            ? ['POST', `/${method}`]
-                            : ['GET', `/${method}`]
+                      : method === 'sessionsPrune'
+                        ? ['POST', '/sessions/prune']
+                        : method === 'sessionsList'
+                          ? ['GET', '/sessions']
+                          : method === 'clearLog'
+                            ? ['POST', '/log/clear']
+                            : method === 'exportLog'
+                              ? ['GET', '/log/export']
+                              : method === 'start' || method === 'stop'
+                                ? ['POST', `/${method}`]
+                                : ['GET', `/${method}`]
         try {
           if (verb === 'GET') {
             return await asJson(await fetch(API + path, { credentials: 'same-origin' }))
@@ -153,18 +157,30 @@ window.__ModuleLoader__.load({
       const [envPath, setEnvPath] = useState('')
       const [installDir, setInstallDir] = useState('')
       const [mirror, setMirror] = useState('')
+      const [saved, setSaved] = useState({ envPath: '', installDir: '', mirror: '' })
       const [checking, setChecking] = useState(false)
+      const [savedAt, setSavedAt] = useState(0)
       const [logLines, setLogLines] = useState([])
+      const [sessions, setSessions] = useState([])
+      const [pruneMsg, setPruneMsg] = useState('')
 
       useEffect(() => {
         let alive = true
         rpc('depsCheck', {}).then((r) => {
           if (!alive || !r?.ok) return
           setDeps(r)
-          setEnvPath(r.envPath ?? '')
-          setInstallDir(r.installDir ?? '')
-          setMirror((r.mirrors?.[0]?.index) ?? '')
+          // 用**已落盘的值**初始化，不是用 mirrors[0] —— 那个是建议值，会把用户填的覆盖掉
+          const cur = {
+            envPath: r.envPath ?? '',
+            installDir: r.installDir ?? '',
+            mirror: r.mirror ?? (r.mirrors?.[0]?.index ?? ''),
+          }
+          setEnvPath(cur.envPath)
+          setInstallDir(cur.installDir)
+          setMirror(cur.mirror)
+          setSaved(cur)
         })
+        rpc('sessionsList', {}).then((r) => { if (alive && r?.ok) setSessions(r.sessions ?? []) })
         return () => { alive = false }
       }, [rpc])
 
@@ -175,11 +191,21 @@ window.__ModuleLoader__.load({
       const running = Boolean(status?.running)
       const ready = Boolean(status?.ready)
 
-      // 保存路径并立刻重新检测 —— 这一步只读，不下载
+      // 输入框相对「已保存值」有没有改动
+      const dirty = envPath !== saved.envPath
+        || installDir !== saved.installDir
+        || mirror !== saved.mirror
+
+      // 保存路径并立刻重新检测 —— 写 runtime.json，重启后仍然有效
       const onSavePath = async () => {
         setChecking(true)
-        const r = await rpc('depsConfig', { envPath, installDir, mirror })
-        if (r?.ok) setDeps(r)
+        const payload = { envPath, installDir, mirror }
+        const r = await rpc('depsConfig', payload)
+        if (r?.ok) {
+          setDeps(r)
+          setSaved(payload)
+          setSavedAt(Date.now())
+        }
         setChecking(false)
       }
       const onDownload = async () => {
@@ -285,14 +311,23 @@ window.__ModuleLoader__.load({
 
           h(Row, {
             title: '操作',
-            desc: deps?.usable
-              ? '环境已可用，什么都不用做'
-              : (deps?.pythonPath ? '补装缺的包到这套环境里' : '没填路径时才会真的下载（约 330MB）'),
+            desc: dirty
+              ? '有改动没保存 —— 点「保存」写入 runtime.json，重启后仍然有效'
+              : (deps?.usable
+                  ? '环境已可用，什么都不用做'
+                  : (deps?.pythonPath ? '补装缺的包到这套环境里' : '没填路径时才会真的下载（约 330MB）')),
             last: true,
           },
-            h('div', { style: { display: 'flex', gap: 8 } },
+            h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' } },
+              // ⭐ 保存按钮：把三个输入框的值写进 runtime.json。
+              //    之前只存内存，重启 DSH 就退回默认值 —— 这就是"每次打开又变回去"。
               h('button', {
-                style: css.btn(true),
+                style: css.btn(dirty),
+                onClick: onSavePath,
+                disabled: checking || !dirty,
+              }, checking ? '保存中…' : (dirty ? '保存' : '已保存')),
+              h('button', {
+                style: css.btn(false),
                 onClick: onDownload,
                 disabled: checking || Boolean(deps?.usable),
               }, deps?.usable ? '无需操作' : (deps?.pythonPath ? '补齐依赖' : '下载依赖')),
@@ -303,6 +338,34 @@ window.__ModuleLoader__.load({
                 title: deps?.source === 'user' ? '本机环境不会删' : '',
               }, '删除'))),
         ),
+
+        h(Card, {
+          title: '会话',
+          hint: '一个微信对话对应一个 DSH 会话（在左侧「微信」工作区里）',
+        },
+          h(Row, {
+            title: `已绑定 ${sessions.length} 个`,
+            desc: sessions.length
+              ? sessions.map((s) => `${s.conv}（${s.kind === 'group' ? '群' : '单聊'}）`).join(' · ')
+              : '还没识别到任何对话 —— 微信窗口里要先打开某个聊天',
+          },
+            h('span', { style: css.badge(sessions.length ? 'g' : undefined) },
+              sessions.length ? '正常' : '空')),
+          h(Row, {
+            title: '清理空会话',
+            desc: '早期版本重试时会给同一个对话堆出多个空会话。这里只删「没绑定、不在跑」的',
+            last: true,
+          },
+            h('button', {
+              style: css.btn(false),
+              onClick: async () => {
+                const r = await rpc('sessionsPrune', {})
+                setPruneMsg(r?.ok ? `清理了 ${r.removed?.length ?? 0} 个` : `失败：${r?.error ?? ''}`)
+                const s = await rpc('sessionsList', {})
+                if (s?.ok) setSessions(s.sessions ?? [])
+              },
+            }, '清理'))),
+        pruneMsg ? h('div', { style: { color: T.lb2, fontSize: 12 } }, pruneMsg) : null,
 
         h(Card, { title: '实时日志' },
           h('div', { style: css.log },
@@ -398,11 +461,19 @@ window.__ModuleLoader__.load({
 
     function AllowList({ rpc, cfg, setCfg }) {
       const [saving, setSaving] = useState(false)
+      const [savedAt, setSavedAt] = useState(0)
       const set = (patch) => setCfg({ ...cfg, ...patch })
+
+      // 白名单模式：关掉时按什么规则？
+      //   原项目的非白名单模式 = 「除黑名单/群聊/服务号之外的单聊好友都回」
+      //   —— 危险（谁都能触发），所以默认关，且要用户明确知道细则
+      const whitelistMode = cfg?.whitelist_mode !== false
+
       const save = async () => {
         setSaving(true)
         await rpc('saveConfig', {
           patch: {
+            whitelist_mode: whitelistMode,
             whitelist: cfg?.whitelist ?? [],
             group_whitelist: cfg?.group_whitelist ?? [],
             blacklist: cfg?.blacklist ?? [],
@@ -411,8 +482,29 @@ window.__ModuleLoader__.load({
           },
         })
         setSaving(false)
+        setSavedAt(Date.now())
       }
+
       return h('div', { style: css.wrap },
+        h(Card, {
+          title: '回复范围',
+          hint: whitelistMode
+            ? '只回下面「单聊白名单」和「群聊白名单」里的人，其它一律不回。最安全。'
+            : '⚠️ 白名单模式已关闭：除黑名单外的**所有单聊好友**都会自动回复。'
+              + '群里仍然只回「群聊白名单」里的（群不额外放行，群里说错话是全群可见的）。',
+        },
+          h(Row, {
+            title: '白名单模式',
+            desc: whitelistMode
+              ? '只回名单里的人'
+              : '除黑名单外都回 —— 任何陌生人发消息都会触发，别长期开着',
+            last: true,
+          },
+            h(Switch, {
+              on: whitelistMode,
+              onChange: (v) => set({ whitelist_mode: v }),
+            })),
+        ),
         // 三栏在设置面板里太窄，横向会被切掉。改成 auto-fit：宽了就并排，窄了自动换行堆叠。
         // 每个单元格 minmax(220px,1fr) + minWidth:0 —— 后者是关键，grid 子项默认 min-width:auto
         // 会撑破容器（输入框的 placeholder 就把列顶宽了）。
@@ -455,6 +547,7 @@ window.__ModuleLoader__.load({
             })),
         ),
         h('div', { style: css.or },
+          savedAt ? h('span', { style: { color: T.ok, fontSize: 12, alignSelf: 'center' } }, '✓ 已保存') : null,
           h('button', { style: css.btn(true), onClick: save, disabled: saving }, saving ? '保存中…' : '保存白名单')),
       )
     }

@@ -358,16 +358,42 @@ def get_wechat_hwnd():
 
 def grab_wechat_window(hwnd):
     """
-    开发版后台静默离屏抓图引擎（PrintWindow / DWM）：
-    无论微信被其他窗口覆盖压在底层还是处于离屏隐形状态，都能静默抓取微信自身的 100% 真实画面！
+    后台静默抓图引擎（PrintWindow）。
+
+    ── 2026-11-04 加的最小化防护 ──
+    微信被最小化时 GetWindowRect 返回 (-21333,-21333) 158x26，
+    PrintWindow 抓到的是纯灰 211 的一小条。后果：
+      · compute_wechat_layout 算出 chat_start_x=320 > 窗口宽 237
+        → 右侧聊天区所有坐标全废
+      · 气泡解析把左侧列表预览当成聊天内容
+        → 日志里出现 "昨天19:24"、"AAA跨境运营小王子" 这种串味文本
+      · 模型收到一堆垃圾，要么乱回要么炸
+
+    所以抓图前先确保窗口不是最小化的。用 SW_RESTORE(9) 恢复，
+    但不抢前台（SWP_NOACTIVATE），用户的窗口焦点不动。
     """
     try:
+        # ── 最小化检测与恢复 ──
+        if user32.IsIconic(hwnd):
+            log("🪟 [窗口已最小化] 正在恢复（不抢前台）…", "warn")
+            try:
+                user32.ShowWindow(hwnd, 9)      # SW_RESTORE
+                time.sleep(0.35)                # 等 Qt 重新布局
+            except Exception as e:
+                log(f"⚠️ 恢复窗口失败：{e}", "warn")
+
         rect = wintypes.RECT()
         user32.GetWindowRect(hwnd, ctypes.byref(rect))
         w = rect.right - rect.left
         h = rect.bottom - rect.top
         if w <= 0 or h <= 0:
             w, h = 1100, 750
+
+        # 尺寸太小的窗口抓了也没用 —— 直接拒绝，让上层等下一轮，
+        # 不要拿一张 158x26 的碎图去算 layout 和气泡（那会产出串味文本）。
+        if w < 400 or h < 300:
+            log(f"⚠️ [窗口过小] {w}x{h} —— 微信可能还在最小化，本轮跳过抓图", "warn")
+            return None, rect, 1.0
             
         scale = get_dpi_scale()
         
