@@ -335,6 +335,38 @@ export async function apply(ctx, rawConfig = {}) {
       }
     },
 
+    // 诊断：DSH 里到底有哪些 live agent，能不能按 id 精确取到
+    'GET /agents': () => {
+      const out = { ok: true, agents: [], byId: {}, probes: [] }
+      const ag = (typeof ctx.get === 'function' ? ctx.get('agents') : undefined) ?? ctx.agents
+      if (!ag) { out.ok = false; out.error = 'no-agents-service'; return out }
+
+      // ① list()
+      try {
+        const list = typeof ag.list === 'function' ? ag.list() : []
+        for (const a of (Array.isArray(list) ? list : [])) {
+          const s = a?.session
+          out.agents.push({
+            id: s?.id ?? a?.id ?? null,
+            sessionKeys: s ? Object.keys(s).slice(0, 12) : [],
+            agentKeys: Object.keys(a ?? {}).slice(0, 12),
+            hasFollowup: typeof a?.followup === 'function',
+          })
+        }
+      } catch (e) { out.listError = String(e?.message ?? e) }
+
+      // ② 逐个试 get()
+      for (const sid of (hub.list() ?? []).map((x) => x.sessionId)) {
+        let got = null
+        try {
+          const a = typeof ag.get === 'function' ? ag.get(sid) : undefined
+          got = a ? { hasFollowup: typeof a?.followup === 'function' } : null
+        } catch (e) { got = { error: String(e?.message ?? e) } }
+        out.byId[sid] = got
+      }
+      return out
+    },
+
     // 当前绑定情况
     'GET /sessions': () => ({
       ok: true,
